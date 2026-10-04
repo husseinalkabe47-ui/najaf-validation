@@ -1,0 +1,68 @@
+name: Validate database schema
+
+on:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        schema: [working-18-14, delivered-11.2]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: pw
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: pw
+      PERF_SOFT: "1"
+      KEEP_DB: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack the package
+        run: |
+          unzip -q najaf-phase11-3-validation-1.zip
+          chmod +x phase11-3/run_validation.sh phase11-3/concurrency/run_concurrency.sh
+
+      - name: Run validation
+        id: run
+        working-directory: phase11-3
+        run: |
+          export PATH=/usr/lib/postgresql/16/bin:$PATH
+          export SCHEMA_FILE="$PWD/najaf_schema_v1.${{ matrix.schema }}.sql"
+          set +e
+          ./run_validation.sh
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Show the summary on the run page
+        if: always()
+        working-directory: phase11-3
+        run: |
+          echo "## Schema: ${{ matrix.schema }} (script exit code: ${{ steps.run.outputs.rc }})" >> "$GITHUB_STEP_SUMMARY"
+          for f in results/*/summary.md; do
+            [ -f "$f" ] && head -c 900000 "$f" >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo "---- console ----"
+          cat results/*/console.log 2>/dev/null || true
+
+      - name: Keep all result files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.schema }}
+          path: phase11-3/results
+          retention-days: 30
