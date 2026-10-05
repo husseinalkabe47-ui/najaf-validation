@@ -1,0 +1,200 @@
+name: Backend (Phase 11.4.1)
+
+# طھط´ط؛ظٹظ„ ظٹط¯ظˆظٹ ظپظ‚ط· (Actions â†گ Backend (Phase 11.4.1) â†گ Run workflow).
+# ط§ظ„ظˆط¸ظٹظپط© ط§ظ„ط£ظˆظ„ظ‰: ط§ظ†ط­ط¯ط§ط± ط§ظ„ظˆط§ط¬ظ‡ط© (33 ظ…ظ„ظپ ط§ط®طھط¨ط§ط±) + ط³ظ„ط§ظ…ط© ط·ط¨ظ‚ط© ظ‚ط§ط¹ط¯ط© ط§ظ„ط¨ظٹط§ظ†ط§طھطŒ ظ„ط¥ط«ط¨ط§طھ ط£ظ† ط¥ط¶ط§ظپط© backend/ ظ„ظ… طھظƒط³ط± ط´ظٹط¦ظ‹ط§.
+# ط§ظ„ظˆط¸ظٹظپط© ط§ظ„ط«ط§ظ†ظٹط©: ط§ظ„ظ€Backend ط¹ظ„ظ‰ PostgreSQL 16 ط­ظ‚ظٹظ‚ظٹ ظ…ط¹ ط§ظ„طھط±ط­ظٹظ„ط§طھ ط§ظ„ظ…ظڈط®طھط¨ظژط±ط© 0001-0013 ظˆط¯ظˆط± ط§ظ„ط§طھطµط§ظ„ ط§ظ„ط£ط¯ظ†ظ‰ ط§ظ…طھظٹط§ط²ظ‹ط§.
+on:
+  workflow_dispatch:
+
+jobs:
+  app-regression:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # ط¥ظ† ظ„ظ… طھظƒظ† ظ…ظ„ظپط§طھ ط§ظ„ظ…ط´ط±ظˆط¹ ظپظٹ ط¬ط°ط± ط§ظ„ظ…ط³طھظˆط¯ط¹ (ط±ظپط¹طھظژ ZIP ظˆط§ط­ط¯ظ‹ط§ ظپظ‚ط·) طھظڈظپظƒظ‘ ظ…ظ† ط£ط­ط¯ط« najaf-showrooms-app*.zip ظˆطھظڈظ†ط³ط® ط¥ظ„ظ‰ ط§ظ„ط¬ط°ط±.
+      # ظˆط¥ظ† ظƒط§ظ†طھ ط§ظ„ظ…ظ„ظپط§طھ ظپظٹ ط§ظ„ط¬ط°ط± (ط±ظپط¹ ط§ظ„ظ…ط´ط±ظˆط¹ ظƒط§ظ…ظ„ظ‹ط§) ظ„ط§ طھظپط¹ظ„ ظ‡ط°ظ‡ ط§ظ„ط®ط·ظˆط© ط´ظٹط¦ظ‹ط§.
+      - name: Unpack the project zip if the project is not at the repository root
+        run: |
+          set -euo pipefail
+          if [ -f backend/package.json ] && [ -d database/migrations ]; then
+            echo "project files are already at the repository root"
+            exit 0
+          fi
+          shopt -s nullglob
+          zips=( najaf-showrooms-app*.zip )
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::Project files not found at the repository root and no najaf-showrooms-app*.zip to unpack"
+            ls -la
+            exit 1
+          fi
+          best=""; bestt=-1
+          for z in "${zips[@]}"; do
+            t=$(git log -1 --format=%ct -- "$z" 2>/dev/null || true); t=${t:-0}
+            echo "found: $z (last commit time: $t)"
+            if [ "$t" -gt "$bestt" ]; then best="$z"; bestt="$t"; fi
+          done
+          echo "using: $best"
+          rm -rf _project && mkdir _project
+          unzip -q "$best" -d _project
+          marker=$(find _project -maxdepth 4 -path '*/backend/package.json' | head -n 1)
+          if [ -z "$marker" ]; then
+            echo "::error::backend/package.json not found inside $best"
+            find _project -maxdepth 3 | head -40
+            exit 1
+          fi
+          root=$(dirname "$(dirname "$marker")")
+          cp -a "$root"/. .
+          rm -rf _project
+          echo "project unpacked from $best"
+          ls
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Frontend test suites (tests/*.test.js)
+        run: |
+          fail=0
+          for f in tests/*.test.js; do
+            out=$(node "$f" 2>&1) || { echo "FAILED: $f"; fail=1; }
+            echo "$f: $(echo "$out" | grep -E 'ط§ظ„ظ†طھظٹط¬ط©: [0-9]+ ظ†ط¬ط­' | tail -1)"
+          done
+          exit $fail
+      - name: Database layer integrity (checksums, migrations equal the validated schema)
+        run: python3 database/tools/verify_integrity.py
+
+  backend:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: pw
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: pw
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # ط¥ظ† ظ„ظ… طھظƒظ† ظ…ظ„ظپط§طھ ط§ظ„ظ…ط´ط±ظˆط¹ ظپظٹ ط¬ط°ط± ط§ظ„ظ…ط³طھظˆط¯ط¹ (ط±ظپط¹طھظژ ZIP ظˆط§ط­ط¯ظ‹ط§ ظپظ‚ط·) طھظڈظپظƒظ‘ ظ…ظ† ط£ط­ط¯ط« najaf-showrooms-app*.zip ظˆطھظڈظ†ط³ط® ط¥ظ„ظ‰ ط§ظ„ط¬ط°ط±.
+      # ظˆط¥ظ† ظƒط§ظ†طھ ط§ظ„ظ…ظ„ظپط§طھ ظپظٹ ط§ظ„ط¬ط°ط± (ط±ظپط¹ ط§ظ„ظ…ط´ط±ظˆط¹ ظƒط§ظ…ظ„ظ‹ط§) ظ„ط§ طھظپط¹ظ„ ظ‡ط°ظ‡ ط§ظ„ط®ط·ظˆط© ط´ظٹط¦ظ‹ط§.
+      - name: Unpack the project zip if the project is not at the repository root
+        run: |
+          set -euo pipefail
+          if [ -f backend/package.json ] && [ -d database/migrations ]; then
+            echo "project files are already at the repository root"
+            exit 0
+          fi
+          shopt -s nullglob
+          zips=( najaf-showrooms-app*.zip )
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::Project files not found at the repository root and no najaf-showrooms-app*.zip to unpack"
+            ls -la
+            exit 1
+          fi
+          best=""; bestt=-1
+          for z in "${zips[@]}"; do
+            t=$(git log -1 --format=%ct -- "$z" 2>/dev/null || true); t=${t:-0}
+            echo "found: $z (last commit time: $t)"
+            if [ "$t" -gt "$bestt" ]; then best="$z"; bestt="$t"; fi
+          done
+          echo "using: $best"
+          rm -rf _project && mkdir _project
+          unzip -q "$best" -d _project
+          marker=$(find _project -maxdepth 4 -path '*/backend/package.json' | head -n 1)
+          if [ -z "$marker" ]; then
+            echo "::error::backend/package.json not found inside $best"
+            find _project -maxdepth 3 | head -40
+            exit 1
+          fi
+          root=$(dirname "$(dirname "$marker")")
+          cp -a "$root"/. .
+          rm -rf _project
+          echo "project unpacked from $best"
+          ls
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          check-latest: true
+      - name: Tool versions (native TypeScript needs Node >= 22.18)
+        run: |
+          node -v
+          psql --version
+          node -e "const [a,b]=process.versions.node.split('.').map(Number); if (a<22||(a===22&&b<18)) { console.error('Node >= 22.18 required'); process.exit(1) }"
+
+      - name: Create the database and apply the validated migrations 0001-0013, then the staging seed
+        run: |
+          createdb najaf
+          for f in database/migrations/*.sql; do
+            echo "== $f"
+            psql -v ON_ERROR_STOP=1 -1 -q -d najaf -f "$f"
+          done
+          psql -v ON_ERROR_STOP=1 -q -d najaf -f database/seed/najaf_demo_seed.sql
+
+      - name: Create the least-privilege application login role (CI-only password)
+        run: psql -v ON_ERROR_STOP=1 -q -d najaf -v login=najaf_app_login -v pw=ci-only-password -f backend/ops/create_app_login.sql
+
+      - name: Install backend dependencies
+        id: install
+        working-directory: backend
+        run: npm install --no-audit --no-fund
+
+      - name: Type check (tsc)
+        if: always() && steps.install.outcome == 'success'
+        working-directory: backend
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        if: always() && steps.install.outcome == 'success'
+        working-directory: backend
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee ../unit.log
+
+      - name: Integration tests (real PostgreSQL 16, application login role)
+        if: always() && steps.install.outcome == 'success'
+        working-directory: backend
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgres://najaf_app_login:ci-only-password@localhost:5432/najaf
+          ADMIN_DATABASE_URL: postgres://postgres:pw@localhost:5432/najaf
+          SEED_LOADED: "1"
+        run: |
+          set -o pipefail
+          npm run test:integration 2>&1 | tee ../integration.log
+
+      - name: db:check (operator tool)
+        if: always() && steps.install.outcome == 'success'
+        working-directory: backend
+        env:
+          DATABASE_URL: postgres://najaf_app_login:ci-only-password@localhost:5432/najaf
+        run: npm run db:check
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Backend 11.4.1"
+            echo "### unit"; grep -E '^â„¹ (tests|suites|pass|fail|cancelled|skipped)' unit.log || echo "(no unit log)"
+            echo "### integration"; grep -E '^â„¹ (tests|suites|pass|fail|cancelled|skipped)' integration.log || echo "(no integration log)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-logs
+          path: |
+            unit.log
+            integration.log
+          if-no-files-found: ignore
