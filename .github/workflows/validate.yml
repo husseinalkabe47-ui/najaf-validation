@@ -32,11 +32,44 @@ jobs:
       KEEP_DB: "0"
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Unpack the package
+      # يقبل أي اسم ZIP يبدأ بـ najaf-phase11-3-validation (مثل -2 أو -2-1 أو "-2 (1)") ويختار الأحدث رفعًا،
+      # ويبحث عن run_validation.sh داخله أيًّا كان عمق المجلد، ثم يطبّع المسار إلى phase11-3/ دائمًا.
+      - name: Find and unpack the package
         run: |
-          unzip -q najaf-phase11-3-validation-1.zip
+          set -euo pipefail
+          shopt -s nullglob
+          zips=( najaf-phase11-3-validation*.zip )
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::No najaf-phase11-3-validation*.zip found in the repository root"
+            ls -la
+            exit 1
+          fi
+          best=""; bestt=-1
+          for z in "${zips[@]}"; do
+            t=$(git log -1 --format=%ct -- "$z" 2>/dev/null || true); t=${t:-0}
+            echo "found: $z (last commit time: $t)"
+            if [ "$t" -gt "$bestt" ] || { [ "$t" -eq "$bestt" ] && [ "$z" = "najaf-phase11-3-validation-2.zip" ]; }; then
+              best="$z"; bestt="$t"
+            fi
+          done
+          echo "using: $best"
+          rm -rf _pkg phase11-3
+          mkdir _pkg
+          unzip -q "$best" -d _pkg
+          script=$(find _pkg -maxdepth 4 -name run_validation.sh | head -n 1)
+          if [ -z "$script" ]; then
+            echo "::error::run_validation.sh not found inside $best"
+            find _pkg | head -50
+            exit 1
+          fi
+          dir=$(dirname "$script")
+          mv "$dir" phase11-3
           chmod +x phase11-3/run_validation.sh phase11-3/concurrency/run_concurrency.sh
+          echo "package ready at phase11-3/ (zip: $best, original folder: $dir)"
+          ls phase11-3
 
       - name: Run validation
         id: run
