@@ -1,0 +1,232 @@
+name: Migration runner (Phase 11.4.2)
+
+# تشغيل يدوي: Actions ← "Migration runner (Phase 11.4.2)" ← Run workflow.
+# يطبّق الترحيلات المُختبَرة 0001-0013 كما هي عبر node-pg-migrate 9.0.0 المثبَّتة، بحساب ترحيل منفصل (najaf_migrator)،
+# ويختبر التطبيق والتراجع الحقيقي وإعادة التطبيق على PostgreSQL 16 حقيقي، ويقارن المخطط الناتج بمخطط psql -1.
+on:
+  workflow_dispatch:
+
+jobs:
+  migrations:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: pw
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: pw
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # إن لم تكن ملفات المشروع في جذر المستودع (رفعتَ ZIP واحدًا فقط) تُفكّ من أحدث najaf-showrooms-app*.zip.
+      - name: Unpack the project zip if the project is not at the repository root
+        run: |
+          set -euo pipefail
+          if [ -f backend/package.json ] && [ -d database/migrations ]; then
+            echo "project files are already at the repository root"
+            exit 0
+          fi
+          shopt -s nullglob
+          zips=( najaf-showrooms-app*.zip )
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::Project files not found at the repository root and no najaf-showrooms-app*.zip to unpack"
+            ls -la
+            exit 1
+          fi
+          best=""; bestt=-1
+          for z in "${zips[@]}"; do
+            t=$(git log -1 --format=%ct -- "$z" 2>/dev/null || true); t=${t:-0}
+            if [ "$t" -gt "$bestt" ]; then best="$z"; bestt="$t"; fi
+          done
+          echo "using: $best"
+          rm -rf _project && mkdir _project
+          unzip -q "$best" -d _project
+          marker=$(find _project -maxdepth 4 -path '*/backend/package.json' | head -n 1)
+          if [ -z "$marker" ]; then echo "::error::backend/package.json not found inside $best"; exit 1; fi
+          root=$(dirname "$(dirname "$marker")")
+          cp -a "$root"/. .
+          rm -rf _project
+          ls
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          check-latest: true
+
+      - name: Install the backend dependencies and verify the pinned tool version
+        id: install
+        working-directory: backend
+        run: |
+          npm install --no-audit --no-fund
+          INSTALLED=$(node -p "JSON.parse(require('fs').readFileSync('node_modules/node-pg-migrate/package.json','utf8')).version")
+          echo "node-pg-migrate installed: $INSTALLED"
+          if [ "$INSTALLED" != "9.0.0" ]; then echo "::error::expected node-pg-migrate 9.0.0 but got $INSTALLED"; exit 1; fi
+
+      - name: Create the empty test database and the dedicated migration account
+        run: |
+          createdb najaf_mig
+          psql -v ON_ERROR_STOP=1 -q -d najaf_mig -v login=najaf_migrator -v pw=ci-only-migrator -f backend/ops/create_migration_role.sql
+          psql -X -q -At -d najaf_mig -c "SELECT 'owner=' || pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'najaf_mig'"
+
+      - name: Type check
+        if: always() && steps.install.outcome == 'success'
+        working-directory: backend
+        run: npx tsc --noEmit
+
+      - name: Unit tests (all)
+        if: always() && steps.install.outcome == 'success'
+        working-directory: backend
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee ../unit.log
+
+      - name: Migration runner integration tests (real PostgreSQL 16)
+        if: always() && steps.install.outcome == 'success'
+        working-directory: backend
+        env:
+          NODE_ENV: test
+          MIGRATION_DATABASE_URL: postgres://najaf_migrator:ci-only-migrator@localhost:5432/najaf_mig
+          ADMIN_DATABASE_URL: postgres://postgres:pw@localhost:5432/najaf_mig
+          DATABASE_URL: postgres://najaf_app_login:ci-only-password@localhost:5432/najaf_mig
+        run: |
+          set -o pipefail
+          node --disable-warning=ExperimentalWarning --test --test-reporter=spec --test-concurrency=1 test/integration/migrate.integration.test.ts 2>&1 | tee ../migrate-integration.log
+
+      - name: Command-line tool smoke test on a second empty database
+        if: always() && steps.install.outcome == 'success'
+        working-directory: backend
+        env:
+          NODE_ENV: test
+          MIGRATION_DATABASE_URL: postgres://najaf_migrator:ci-only-migrator@localhost:5432/najaf_cli
+        run: |
+          # errexit is OFF on purpose (GitHub's default shell is bash -e): every exit code is checked explicitly below,
+          # including the one that is EXPECTED to be non-zero (a rollback without a count must exit 64).
+          set +e
+          set -uo pipefail
+          FAILED=0
+          ERR=$(mktemp)
+          fail() { echo "::error::$1"; FAILED=1; }
+          die() { echo "::error::$1"; exit 1; }
+          # run NAME EXPECTED_EXIT_CODE COMMAND...  -> stdout in $OUT, exit code in $RC; any other exit code is a failure
+          run() {
+            local name="$1" want="$2"; shift 2
+            OUT=$("$@" 2>"$ERR"); RC=$?
+            echo "== $name (exit $RC, expected $want)"
+            echo "$OUT" | head -30
+            if [ -s "$ERR" ]; then echo "-- stderr:"; head -8 "$ERR"; fi
+            if [ "$RC" -ne "$want" ]; then fail "$name: exit code $RC, expected $want"; return 1; fi
+            return 0
+          }
+          # count JSON_TEXT FIELD -> length of the array FIELD of a command's JSON output; fails unless ok is true
+          count() { printf '%s' "$1" | node -e "const j = JSON.parse(require('fs').readFileSync(0, 'utf8')); if (j.ok !== true) process.exit(2); console.log(j['$2'].length);"; }
+          # check_status LABEL APPLIED PENDING -> the last command output must be a status document with these counts
+          check_status() {
+            local a p
+            if ! a=$(count "$OUT" applied) || ! p=$(count "$OUT" pending); then fail "$1: output is not a valid status document"; return 1; fi
+            if [ "$a" != "$2" ] || [ "$p" != "$3" ]; then fail "$1: applied=$a pending=$p, expected applied=$2 pending=$3"; return 1; fi
+            echo "OK $1: applied=$a pending=$p"
+          }
+          # check_ran LABEL COUNT -> the last command output must report exactly COUNT migrations run
+          check_ran() {
+            local n
+            if ! n=$(count "$OUT" ran); then fail "$1: output is not a valid result document"; return 1; fi
+            if [ "$n" != "$2" ]; then fail "$1: ran=$n, expected $2"; return 1; fi
+            echo "OK $1: ran=$n"
+          }
+
+          createdb najaf_cli || die "createdb najaf_cli failed"
+          psql -v ON_ERROR_STOP=1 -q -d najaf_cli -v login=najaf_migrator -v pw=ci-only-migrator -f ops/create_migration_role.sql || die "creating the migration account failed"
+
+          run "status on an empty database" 0 npm run db:migrate:status --silent && check_status "empty database" 0 13
+          run "migrate (apply 0001-0013)" 0 npm run db:migrate --silent && check_ran "migrate" 13
+          run "status after migrate" 0 npm run db:migrate:status --silent && check_status "after migrate" 13 0
+          # a rollback without a count must be refused (usage error 64) and must change nothing
+          run "rollback without a count is refused" 64 npm run db:rollback --silent
+          run "status after the refused rollback" 0 npm run db:migrate:status --silent && check_status "after the refused rollback" 13 0
+          run "rollback --steps 1" 0 npm run db:rollback --silent -- --steps 1 && check_ran "rollback --steps 1" 1
+          run "status after rollback --steps 1" 0 npm run db:migrate:status --silent && check_status "after rollback --steps 1" 12 1
+          run "rollback --all" 0 npm run db:rollback --silent -- --all
+          run "status after rollback --all" 0 npm run db:migrate:status --silent && check_status "after rollback --all" 0 13
+
+          if [ "$FAILED" -ne 0 ]; then echo "command-line smoke test FAILED"; exit 1; fi
+          echo "command-line smoke test passed"
+
+      - name: Schema applied by the runner equals the psql -1 reference (pg_dump --schema-only)
+        if: always() && steps.install.outcome == 'success'
+        working-directory: backend
+        run: |
+          # errexit is OFF on purpose (GitHub's default shell is bash -e): every command's status is checked explicitly below.
+          set +e
+          set -uo pipefail
+          die() { echo "::error::$1"; exit 1; }
+          ERR=$(mktemp)
+          # dumpdb DB OUTFILE -> normalized schema-only dump; fails if pg_dump fails, or the dump is empty or incomplete
+          dumpdb() {
+            local st
+            pg_dump -s --no-owner --exclude-schema=ops -d "$1" 2>"$ERR" | grep -v -E '^--' | grep -v -E '^\\(un)?restrict' | sed -E 's/[[:space:]]+$//' | cat -s > "$2"
+            st=("${PIPESTATUS[@]}")
+            if [ "${st[0]}" -ne 0 ]; then die "pg_dump failed for database $1: $(head -3 "$ERR")"; fi
+            if [ ! -s "$2" ]; then die "the dump of database $1 is empty"; fi
+            local tables
+            tables=$(grep -c '^CREATE TABLE ' "$2" || true)
+            if [ "$tables" != "16" ]; then die "the dump of database $1 has $tables CREATE TABLE statements, expected 16"; fi
+          }
+
+          n=$(ls ../database/migrations/*.sql | wc -l)
+          if [ "$n" != "13" ]; then die "expected 13 migration files, found $n"; fi
+          createdb najaf_ref || die "createdb najaf_ref failed"
+          for f in ../database/migrations/*.sql; do
+            echo "== psql -1 $f"
+            psql -X -q -v ON_ERROR_STOP=1 -1 -d najaf_ref -f "$f" >/dev/null || die "reference apply failed at $f"
+          done
+          dumpdb najaf_ref /tmp/ref.sql
+          # the runner: apply on a third empty database
+          createdb najaf_eq || die "createdb najaf_eq failed"
+          psql -v ON_ERROR_STOP=1 -q -d najaf_eq -v login=najaf_migrator -v pw=ci-only-migrator -f ops/create_migration_role.sql || die "creating the migration account failed"
+          OUT=$(MIGRATION_DATABASE_URL=postgres://najaf_migrator:ci-only-migrator@localhost:5432/najaf_eq NODE_ENV=test npm run db:migrate --silent 2>"$ERR"); RC=$?
+          echo "$OUT" | tail -3
+          if [ "$RC" -ne 0 ]; then die "the runner failed to apply the migrations (exit $RC): $(head -5 "$ERR")"; fi
+          RAN=$(printf '%s' "$OUT" | node -e "const j = JSON.parse(require('fs').readFileSync(0, 'utf8')); if (j.ok !== true) process.exit(2); console.log(j.ran.length);") || die "the runner output is not a valid result document"
+          if [ "$RAN" != "13" ]; then die "the runner applied $RAN migrations, expected 13"; fi
+          dumpdb najaf_eq /tmp/eq.sql
+          if diff -q /tmp/ref.sql /tmp/eq.sql >/dev/null; then
+            echo "EQUIVALENT: the runner-applied schema is identical to the psql -1 reference ($(wc -l < /tmp/eq.sql) lines)"
+            echo "### Schema equivalence: identical to the psql -1 reference" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "DIFFERENT:"; diff -u /tmp/ref.sql /tmp/eq.sql | head -60
+            echo "### Schema equivalence: DIFFERENT (see the step log)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Migration runner 11.4.2"
+            echo "### unit"; grep -E '^ℹ (tests|suites|pass|fail|cancelled|skipped)' unit.log || echo "(no unit log)"
+            echo "### integration (migrate)"; grep -E '^ℹ (tests|suites|pass|fail|cancelled|skipped)' migrate-integration.log || echo "(no integration log)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migrations-logs
+          path: |
+            unit.log
+            migrate-integration.log
+          if-no-files-found: ignore
